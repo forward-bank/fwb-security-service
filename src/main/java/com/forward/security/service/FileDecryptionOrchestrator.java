@@ -10,12 +10,12 @@ import com.forward.security.repository.BankCustPgpKeyLinkRepository;
 import com.forward.security.repository.CustomerPublicKeyRepository;
 import com.forward.security.s3.S3StreamDownloader;
 import com.forward.security.s3.S3Uploader;
+import com.forward.security.util.PassphraseEncryptionUtil;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.io.InputStream;
-import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
-import java.util.Base64;
 import java.util.Optional;
 
 /**
@@ -26,8 +26,13 @@ import java.util.Optional;
  * {@code FWB_MST_BANK_PGP_PRIVATE_KEY} on {@code BANK_KEY_SEQ} for the given
  * {@code CUST_ID} to obtain:
  * <ul>
- *   <li>The raw PGP private key bytes stored in the {@code KEY} BYTEA column.</li>
- *   <li>The Base64-encoded PGP passphrase stored in the {@code PASSPHRASE} column.</li>
+ *   <li>The {@code BANK_PVT_KEY_S3_PATH} column — S3 path to the armored PGP
+ *       private key file. The {@code KEY} BYTEA column is null; the key material
+ *       is always fetched from S3 at runtime.</li>
+ *   <li>The {@code PASSPHRASE} column, which holds the bank key passphrase
+ *       AES-256-CBC encrypted (via {@link PassphraseEncryptionUtil}) and then
+ *       Base64-encoded — NOT a plain Base64-encoded passphrase. It must be
+ *       decrypted with {@code crypto.key} before use, not just Base64-decoded.</li>
  * </ul>
  *
  * <h2>Decrypted file path rule</h2>
@@ -55,17 +60,20 @@ public class FileDecryptionOrchestrator {
     private final S3StreamDownloader           s3Downloader;
     private final S3Uploader                   s3Uploader;
     private final PgpDecryptionService         pgpDecryptionService;
+    private final String                       cryptoAesKey;
 
     public FileDecryptionOrchestrator(BankCustPgpKeyLinkRepository keyLinkRepository,
                                       CustomerPublicKeyRepository customerKeyRepository,
                                       S3StreamDownloader s3Downloader,
                                       S3Uploader s3Uploader,
-                                      PgpDecryptionService pgpDecryptionService) {
+                                      PgpDecryptionService pgpDecryptionService,
+                                      @Value("${crypto.key}") String cryptoAesKey) {
         this.keyLinkRepository    = keyLinkRepository;
         this.customerKeyRepository = customerKeyRepository;
         this.s3Downloader          = s3Downloader;
         this.s3Uploader            = s3Uploader;
         this.pgpDecryptionService  = pgpDecryptionService;
+        this.cryptoAesKey          = cryptoAesKey;
     }
 
     /**
@@ -101,7 +109,7 @@ public class FileDecryptionOrchestrator {
         if (bankKeyOpt.isEmpty()) {
             return DecryptionResponse.failure(custId, "SSE_009",
                     "No active bank private key linked to customer ID: " + custId
-                    + ". Check FWB_MST_BANK_CUST_PGP_KEY_LINK and FWB_MST_BANK_PGP_PRIVATE_KEY.");
+                            + ". Check FWB_MST_BANK_CUST_PGP_KEY_LINK and FWB_MST_BANK_PGP_PRIVATE_KEY.");
         }
         BankPgpPrivateKey bankKey = bankKeyOpt.get();
 
@@ -109,12 +117,31 @@ public class FileDecryptionOrchestrator {
                 + " | bankKeySeq=" + bankKey.getBankKeySeq()
                 + " | keyName=" + bankKey.getKeyName());
 
-        // ── Step 3: the KEY column holds the raw PGP private key bytes ─────────
-        //    (stored as BYTEA — no application-level decryption needed)
-        byte[] bankPrivateKeyBytes = bankKey.getKey();
-        if (bankPrivateKeyBytes == null || bankPrivateKeyBytes.length == 0) {
+        // ── Step 3: download the bank's PGP private key bytes from S3 ───────────
+        //    The KEY column in FWB_MST_BANK_PGP_PRIVATE_KEY is null;
+        //    the actual key material lives in S3 at BANK_PVT_KEY_S3_PATH.
+        String bankPvtKeyS3Path = bankKey.getBankPvtKeyS3Path();
+        if (bankPvtKeyS3Path == null || bankPvtKeyS3Path.isBlank()) {
             return DecryptionResponse.failure(custId, "SSE_009",
-                    "Bank private key blob is empty for bankKeySeq: " + bankKey.getBankKeySeq());
+                    "BANK_PVT_KEY_S3_PATH is null or blank for bankKeySeq: "
+                            + bankKey.getBankKeySeq() + ". Cannot locate private key in S3.");
+        }
+
+        byte[] bankPrivateKeyBytes;
+        try {
+            bankPrivateKeyBytes = s3Downloader.downloadBytes(bankPvtKeyS3Path);
+            System.out.println("  [FileDecryptionOrchestrator] downloaded bank private key from S3"
+                    + " | s3Path=" + bankPvtKeyS3Path
+                    + " | bytes=" + bankPrivateKeyBytes.length);
+        } catch (S3StreamDownloader.S3DownloadException e) {
+            return DecryptionResponse.failure(custId, "SSE_010",
+                    "Failed to download bank private key from S3 path '"
+                            + bankPvtKeyS3Path + "': " + e.getMessage());
+        }
+
+        if (bankPrivateKeyBytes.length == 0) {
+            return DecryptionResponse.failure(custId, "SSE_009",
+                    "Bank private key downloaded from S3 is empty: " + bankPvtKeyS3Path);
         }
 
         // ── Step 4: download the customer's public key from S3 (signing only) ──
@@ -135,14 +162,19 @@ public class FileDecryptionOrchestrator {
             }
         }
 
-        // ── Step 5: decode the Base64 PGP passphrase ──────────────────────────
+        // ── Step 5: decrypt the AES-256-CBC-encrypted, Base64-wrapped passphrase ─
         char[] passphraseChars = null;
         try {
-            byte[] decoded = Base64.getMimeDecoder().decode(bankKey.getPassphrase().trim());
-            passphraseChars = new String(decoded, StandardCharsets.UTF_8).toCharArray();
+            String decryptedPassphrase = PassphraseEncryptionUtil.decryptPassphrase(
+                    bankKey.getPassphrase().trim(), cryptoAesKey);
+            passphraseChars = decryptedPassphrase.toCharArray();
         } catch (IllegalArgumentException e) {
             return DecryptionResponse.failure(custId, "SSE_011",
-                    "Bank key passphrase is not valid Base64: " + e.getMessage());
+                    "Bank key passphrase is not valid Base64 or the AES key is invalid: "
+                            + e.getMessage());
+        } catch (Exception e) {
+            return DecryptionResponse.failure(custId, "SSE_011",
+                    "Failed to decrypt bank key passphrase: " + e.getMessage());
         }
 
         // ── Step 6: stream the encrypted file from S3 and decrypt ─────────────
@@ -240,7 +272,7 @@ public class FileDecryptionOrchestrator {
             } else {
                 throw new IllegalArgumentException(
                         "Cannot build decrypted file path: '.PM' marker not found in filename '"
-                        + filename + "' (full path: " + fileS3Path + ")");
+                                + filename + "' (full path: " + fileS3Path + ")");
             }
         }
 
