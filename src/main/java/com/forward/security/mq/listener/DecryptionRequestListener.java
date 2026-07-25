@@ -15,31 +15,41 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
- * IBM MQ message listener for the security service.
+ * IBM MQ message listener for {@code SECURITY.SERVICE.REQUEST.QUEUE}.
  *
- * Lifecycle: managed by Spring via {@code initMethod="start"} and
- * {@code destroyMethod="stop"} defined in {@link com.forward.security.config.MQListenerConfig}.
+ * <h2>Inbound message (JSON)</h2>
+ * <pre>
+ * {
+ *   "custId"           : 1001,
+ *   "fileS3Path"       : "forward-bank-payments/FWB_DIRECT_DEBIT/PAYMENT_FILES/2026/02/04/INCOMING/I1234567890123.FWB.pain00800108.ABCD123.PM.pgp_12345145",
+ *   "pgpSigningEnabled": false
+ * }
+ * </pre>
  *
- * Processing flow for each incoming message:
- *  1. Poison-message guard — discard after {@value #MAX_DELIVERY_ATTEMPTS} attempts.
- *  2. Parse JSON body into a {@link DecryptionRequest}.
- *  3. Validate mandatory fields.
- *  4. Delegate to {@link FileDecryptionOrchestrator}.
- *  5. Serialize the {@link DecryptionResponse} to JSON and write it to the response queue
- *     with the same {@code JMSCorrelationID}.
+ * <h2>Outbound message (JSON) written to {@code SECURITY.SERVICE.RESPONSE.QUEUE}</h2>
+ * <pre>
+ * {
+ *   "custId"            : 1001,
+ *   "decrypted"         : true,
+ *   "decryptedFilePath" : "forward-bank-payments/FWB_DIRECT_DEBIT/PAYMENT_FILES/2026/02/04/DECRYPTED/I1234567890123.FWB.pain00800108.ABCD123.PM.xml"
+ * }
+ * </pre>
  *
- * Consumer and producer use separate JMS connections to prevent producer activity
- * from interfering with consumer session acknowledgment.
+ * <p>Consumer and producer use separate JMS connections to prevent producer
+ * activity from interfering with consumer session acknowledgment.
+ *
+ * <p>Lifecycle is managed by Spring via {@code initMethod="start"} and
+ * {@code destroyMethod="stop"} in
+ * {@link com.forward.security.config.MQListenerConfig}.
  */
 public class DecryptionRequestListener implements MessageListener {
 
-    private static final ObjectMapper OBJECT_MAPPER        = new ObjectMapper();
+    private static final ObjectMapper OBJECT_MAPPER         = new ObjectMapper();
     private static final int          MAX_DELIVERY_ATTEMPTS = 5;
 
-    private final MQConfig                  mqConfig;
+    private final MQConfig                   mqConfig;
     private final FileDecryptionOrchestrator orchestrator;
 
-    // Separate consumer / producer connections
     private Connection      consumerConnection;
     private Connection      producerConnection;
     private Session         consumerSession;
@@ -47,7 +57,8 @@ public class DecryptionRequestListener implements MessageListener {
     private MessageConsumer consumer;
     private MessageProducer producer;
 
-    public DecryptionRequestListener(MQConfig mqConfig, FileDecryptionOrchestrator orchestrator) {
+    public DecryptionRequestListener(MQConfig mqConfig,
+                                     FileDecryptionOrchestrator orchestrator) {
         this.mqConfig     = mqConfig;
         this.orchestrator = orchestrator;
     }
@@ -58,29 +69,29 @@ public class DecryptionRequestListener implements MessageListener {
         try {
             MQConnectionFactory factory = createFactory();
 
-            // Consumer
+            // Consumer connection
             consumerConnection = factory.createConnection();
             consumerSession    = consumerConnection.createSession(false, Session.AUTO_ACKNOWLEDGE);
             Queue requestQueue = consumerSession.createQueue(MQConfig.REQUEST_QUEUE);
             consumer           = consumerSession.createConsumer(requestQueue);
             consumer.setMessageListener(this);
 
-            // Producer (separate connection)
+            // Producer connection (isolated from consumer)
             producerConnection = factory.createConnection();
             producerSession    = producerConnection.createSession(false, Session.AUTO_ACKNOWLEDGE);
             Queue responseQueue = producerSession.createQueue(MQConfig.RESPONSE_QUEUE);
             producer            = producerSession.createProducer(responseQueue);
 
-            // Start producer first, then consumer
+            // Start producer first so responses can be sent before messages arrive
             producerConnection.start();
             consumerConnection.start();
 
-            System.out.println("╔══════════════════════════════════════════════════════╗");
-            System.out.println("║  DecryptionRequestListener STARTED                    ║");
-            System.out.println("╠══════════════════════════════════════════════════════╣");
+            System.out.println("╔══════════════════════════════════════════════════════════╗");
+            System.out.println("║  DecryptionRequestListener STARTED                        ║");
+            System.out.println("╠══════════════════════════════════════════════════════════╣");
             System.out.println("║  Listening on  : " + MQConfig.REQUEST_QUEUE);
             System.out.println("║  Responding to : " + MQConfig.RESPONSE_QUEUE);
-            System.out.println("╚══════════════════════════════════════════════════════╝");
+            System.out.println("╚══════════════════════════════════════════════════════════╝");
 
         } catch (JMSException e) {
             throw new RuntimeException("Failed to start DecryptionRequestListener", e);
@@ -104,9 +115,9 @@ public class DecryptionRequestListener implements MessageListener {
         System.out.println("\n" + "=".repeat(80));
         System.out.println("DecryptionRequestListener: message received");
 
-        String  correlationId  = null;
-        boolean responseSent   = false;
-        String  encryptedPath  = null;
+        String  correlationId = null;
+        boolean responseSent  = false;
+        Long    custId        = null;
 
         try {
             // ── Poison-message guard ──────────────────────────────────────────
@@ -124,14 +135,14 @@ public class DecryptionRequestListener implements MessageListener {
                 return;
             }
 
-            correlationId = message.getJMSCorrelationID();
+            correlationId      = message.getJMSCorrelationID();
             String requestBody = textMessage.getText();
 
             System.out.println("  JMSMessageID    : " + message.getJMSMessageID());
             System.out.println("  Correlation ID  : " + correlationId);
             System.out.println("  Request Payload : " + requestBody);
 
-            // ── Parse request ─────────────────────────────────────────────────
+            // ── Parse JSON → DecryptionRequest ────────────────────────────────
             DecryptionRequest request;
             try {
                 request = OBJECT_MAPPER.readValue(requestBody, DecryptionRequest.class);
@@ -144,9 +155,9 @@ public class DecryptionRequestListener implements MessageListener {
                 return;
             }
 
-            encryptedPath = request.getEncryptedFilePath();
-            System.out.println("  Customer ID     : " + request.getCustomerId());
-            System.out.println("  Encrypted Path  : " + encryptedPath);
+            custId = request.getCustId();
+            System.out.println("  Customer ID     : " + custId);
+            System.out.println("  File S3 Path    : " + request.getFileS3Path());
             System.out.println("  PGP Signing     : " + request.isPgpSigningEnabled());
 
             // ── Delegate to orchestrator ──────────────────────────────────────
@@ -165,25 +176,28 @@ public class DecryptionRequestListener implements MessageListener {
                     + t.getMessage());
             t.printStackTrace();
         } finally {
-            // Always send a response so the calling process is never left hanging
             if (!responseSent && correlationId != null) {
-                trySendErrorResponse(correlationId, encryptedPath,
+                trySendErrorResponse(correlationId, custId,
                         "SSE_INTERNAL_ERROR", "Unexpected error during processing");
             }
             System.out.println("=".repeat(80));
         }
     }
 
-    // ── Send helpers ──────────────────────────────────────────────────────────
+    // ── Response serialisation ────────────────────────────────────────────────
 
     private void sendResponse(String correlationId,
                                DecryptionResponse response) throws Exception {
         Map<String, Object> payload = new LinkedHashMap<>();
-        payload.put("encryptedFilePath",   nullToEmpty(response.getEncryptedFilePath()));
-        payload.put("decryptedFilePath",   nullToEmpty(response.getDecryptedFilePath()));
-        payload.put("decryptionSuccessful", response.isDecryptionSuccessful());
-        payload.put("errorCode",            nullToEmpty(response.getErrorCode()));
-        payload.put("errorMessage",         nullToEmpty(response.getErrorMessage()));
+        payload.put("custId",            response.getCustId());
+        payload.put("decrypted",         response.isDecrypted());
+        payload.put("decryptedFilePath", nullToEmpty(response.getDecryptedFilePath()));
+
+        // Include error fields only when present — keeps success responses clean
+        if (response.getErrorCode() != null && !response.getErrorCode().isBlank()) {
+            payload.put("errorCode",    response.getErrorCode());
+            payload.put("errorMessage", nullToEmpty(response.getErrorMessage()));
+        }
 
         String payloadJson = OBJECT_MAPPER.writeValueAsString(payload);
 
@@ -197,12 +211,12 @@ public class DecryptionRequestListener implements MessageListener {
     }
 
     private void trySendErrorResponse(String correlationId,
-                                       String encryptedFilePath,
+                                       Long custId,
                                        String errorCode,
                                        String errorMessage) {
         try {
             sendResponse(correlationId,
-                    DecryptionResponse.failure(encryptedFilePath, errorCode, errorMessage));
+                    DecryptionResponse.failure(custId, errorCode, errorMessage));
         } catch (Exception e) {
             System.err.println("✗ Failed to send error response: " + e.getMessage());
         }
@@ -229,19 +243,15 @@ public class DecryptionRequestListener implements MessageListener {
     private void closeQuietly(MessageConsumer c, String name) {
         if (c != null) try { c.close(); } catch (JMSException e) { warn(name, e); }
     }
-
     private void closeQuietly(MessageProducer p, String name) {
         if (p != null) try { p.close(); } catch (JMSException e) { warn(name, e); }
     }
-
     private void closeQuietly(Session s, String name) {
         if (s != null) try { s.close(); } catch (JMSException e) { warn(name, e); }
     }
-
     private void closeQuietly(Connection c, String name) {
         if (c != null) try { c.close(); } catch (JMSException e) { warn(name, e); }
     }
-
     private void warn(String resource, JMSException e) {
         System.err.println("WARN: Failed to close " + resource + ": " + e.getMessage());
     }

@@ -3,46 +3,56 @@ package com.forward.security.model;
 import com.fasterxml.jackson.annotation.JsonProperty;
 
 /**
- * Inbound message received from the IBM MQ request queue.
+ * Inbound message received from {@code SECURITY.SERVICE.REQUEST.QUEUE}.
  *
- * Fields:
- *  - customerId      : unique customer identifier; used to look up the customer's
- *                      public key in S3 (required for signature verification).
- *  - encryptedFilePath : bucket-relative S3 key of the PGP-encrypted payment file.
- *  - pgpSigningEnabled : true  → the file was signed by the customer; verify the signature.
- *                        false → the file is encrypted only; skip signature verification.
+ * <pre>
+ * {
+ *   "custId"           : 1001,
+ *   "fileS3Path"       : "forward-bank-payments/FWB_DIRECT_DEBIT/PAYMENT_FILES/2026/02/04/INCOMING/I1234567890123.FWB.pain00800108.ABCD123.PM.pgp_12345145",
+ *   "pgpSigningEnabled": false
+ * }
+ * </pre>
+ *
+ * <p>{@code custId} is the numeric customer identifier that maps to
+ * {@code CUST_ID} in {@code FWB_MST_BANK_CUST_PGP_KEY_LINK}.
+ *
+ * <p>{@code fileS3Path} is the full S3 path (bucket + key) of the
+ * PGP-encrypted payment file.
+ *
+ * <p>{@code pgpSigningEnabled} — when {@code true} the file was signed
+ * by the customer and signature verification is performed after decryption.
  */
 public class DecryptionRequest {
 
-    @JsonProperty("customerId")
-    private String customerId;
+    @JsonProperty("custId")
+    private Long custId;
 
-    @JsonProperty("encryptedFilePath")
-    private String encryptedFilePath;
+    @JsonProperty("fileS3Path")
+    private String fileS3Path;
 
     @JsonProperty("pgpSigningEnabled")
     private boolean pgpSigningEnabled;
 
     public DecryptionRequest() {}
 
-    public DecryptionRequest(String customerId, String encryptedFilePath, boolean pgpSigningEnabled) {
-        this.customerId         = customerId;
-        this.encryptedFilePath  = encryptedFilePath;
-        this.pgpSigningEnabled  = pgpSigningEnabled;
+    public DecryptionRequest(Long custId, String fileS3Path, boolean pgpSigningEnabled) {
+        this.custId            = custId;
+        this.fileS3Path        = fileS3Path;
+        this.pgpSigningEnabled = pgpSigningEnabled;
     }
 
-    public String getCustomerId()          { return customerId; }
-    public String getEncryptedFilePath()   { return encryptedFilePath; }
+    public Long    getCustId()             { return custId; }
+    public String  getFileS3Path()         { return fileS3Path; }
     public boolean isPgpSigningEnabled()   { return pgpSigningEnabled; }
 
-    public void setCustomerId(String customerId)                  { this.customerId = customerId; }
-    public void setEncryptedFilePath(String encryptedFilePath)    { this.encryptedFilePath = encryptedFilePath; }
-    public void setPgpSigningEnabled(boolean pgpSigningEnabled)   { this.pgpSigningEnabled = pgpSigningEnabled; }
+    public void setCustId(Long custId)                        { this.custId = custId; }
+    public void setFileS3Path(String fileS3Path)              { this.fileS3Path = fileS3Path; }
+    public void setPgpSigningEnabled(boolean pgpSigningEnabled) { this.pgpSigningEnabled = pgpSigningEnabled; }
 
     @Override
     public String toString() {
-        return "DecryptionRequest{customerId='" + customerId
-                + "', encryptedFilePath='" + encryptedFilePath
+        return "DecryptionRequest{custId=" + custId
+                + ", fileS3Path='" + fileS3Path
                 + "', pgpSigningEnabled=" + pgpSigningEnabled + '}';
     }
 }

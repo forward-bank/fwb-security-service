@@ -1,0 +1,255 @@
+# Database Setup for FWB Security Service
+
+## Prerequisites
+
+- PostgreSQL 17 installed on your machine (already confirmed at `C:\Program Files\PostgreSQL\17`)
+- `psql` CLI tool available
+- Existing database `APP_DB_1967` (already created)
+
+## Create the Tables
+
+Open a terminal and run the SQL script to create the three PGP key management tables:
+
+### Option 1: Using Command Line
+
+```cmd
+"C:\Program Files\PostgreSQL\17\bin\psql.exe" -U postgres -d APP_DB_1967 -f database\create_tables.sql
+```
+
+Enter your postgres password when prompted.
+
+### Option 2: Using pgAdmin
+
+1. Open **pgAdmin**
+2. Connect to your PostgreSQL server
+3. Navigate to **Databases → APP_DB_1967**
+4. Right-click on **APP_DB_1967** → **Query Tool**
+5. Open the file: `C:\Users\alamm\projects\forward-bank\fwb-security-service\database\create_tables.sql`
+6. Execute the script (F5 or click the lightning bolt icon)
+
+### Expected Output
+
+```
+DROP TABLE
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+COMMENT
+... (multiple COMMENT lines)
+CREATE TABLE
+COMMENT
+... (multiple COMMENT lines)
+CREATE TABLE
+COMMENT
+... (multiple COMMENT lines)
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+✓ Tables created successfully in APP_DB_1967
+```
+
+## Verify Table Creation
+
+Run this query in psql or pgAdmin to verify:
+
+```sql
+\c APP_DB_1967
+
+SELECT table_name 
+FROM information_schema.tables 
+WHERE table_schema = 'public' 
+  AND table_name IN (
+    'fwb_mst_bank_pgp_private_key', 
+    'fwb_mst_public_key', 
+    'fwb_mst_bank_cust_pgp_key_link'
+  )
+ORDER BY table_name;
+```
+
+Expected output:
+
+```
+            table_name            
+----------------------------------
+ fwb_mst_bank_cust_pgp_key_link
+ fwb_mst_bank_pgp_private_key
+ fwb_mst_public_key
+(3 rows)
+```
+
+## Schema Overview
+
+### 1. FWB_MST_BANK_PGP_PRIVATE_KEY
+
+Stores the bank's PGP private keys.
+
+| Column | Type | Description |
+|---|---|---|
+| BANK_KEY_SEQ | BIGSERIAL | Primary key |
+| KEY_NAME | VARCHAR(30) | Friendly key name |
+| KEY | BYTEA | **Encrypted** PGP private key blob |
+| VALID_FROM | DATE | Key validity start |
+| VALID_TO | DATE | Key validity end |
+| KEY_ACTIVE_FLAG | CHAR(1) | 'Y' or 'N' |
+| KEY_TYPE | VARCHAR(30) | e.g. 'PGP', 'RSA-4096' |
+| PASSPHRASE | VARCHAR(100) | **Base64-encoded** PGP key passphrase |
+| BANK_PVT_KEY_S3_PATH | VARCHAR(100) | Optional S3 path |
+| CREATION_TIMESTAMP | TIMESTAMP | Auto-set on insert |
+
+**Important**: The `KEY` column holds an **encrypted** blob. The encryption/decryption is handled by `PGPPrivateKeyEncryptionService` using AES-256-GCM with PBKDF2 key derivation.
+
+### 2. FWB_MST_PUBLIC_KEY
+
+Stores customer PGP public keys.
+
+| Column | Type | Description |
+|---|---|---|
+| CUST_PUBLIC_KEY_SEQ | BIGSERIAL | Primary key |
+| CUST_ID | BIGINT | Customer identifier |
+| KEY_ACTIVE_FLAG | CHAR(1) | 'Y' or 'N' |
+| KEY_NAME | VARCHAR(100) | Friendly key name |
+| KEY_TYPE | VARCHAR(30) | Key algorithm |
+| KEY | BYTEA | Optional: public key bytes (unencrypted) |
+| VALID_FROM | DATE | Key validity start |
+| VALID_TO | DATE | Key validity end |
+| CUST_PUB_KEY_S3_PATH | VARCHAR(100) | S3 path to `.asc` public key file |
+| CREATION_TIMESTAMP | TIMESTAMP | Auto-set on insert |
+
+**Important**: The `KEY` column is optional. The service primarily uses `CUST_PUB_KEY_S3_PATH` to download the customer's public key from S3.
+
+### 3. FWB_MST_BANK_CUST_PGP_KEY_LINK
+
+Links a bank private key to a specific customer public key record.
+
+| Column | Type | Description |
+|---|---|---|
+| BANK_CUST_KEY_LINK_SEQ | BIGSERIAL | Primary key |
+| BANK_KEY_SEQ | BIGINT | FK → FWB_MST_BANK_PGP_PRIVATE_KEY(BANK_KEY_SEQ) |
+| CUST_PUBLIC_KEY_SEQ | BIGINT | FK → FWB_MST_PUBLIC_KEY(CUST_PUBLIC_KEY_SEQ) |
+| CUST_ID | BIGINT | Denormalised customer ID for fast lookup |
+| KEY_ACTIVE_FLAG | CHAR(1) | 'Y' or 'N' |
+| CREATION_TIMESTAMP | TIMESTAMP | Auto-set on insert |
+
+**Constraints**:
+- Foreign key to `FWB_MST_BANK_PGP_PRIVATE_KEY(BANK_KEY_SEQ)`
+- Foreign key to `FWB_MST_PUBLIC_KEY(CUST_PUBLIC_KEY_SEQ)` — references the PK
+- Unique constraint on `(BANK_KEY_SEQ, CUST_PUBLIC_KEY_SEQ, KEY_ACTIVE_FLAG)`
+
+## Data Flow
+
+1. **External system** populates `FWB_MST_BANK_PGP_PRIVATE_KEY` with the bank's **encrypted** private key
+2. **External system** populates `FWB_MST_PUBLIC_KEY` with customer public key metadata (S3 path)
+3. **External system** creates a link in `FWB_MST_BANK_CUST_PGP_KEY_LINK`
+4. When a decryption request arrives:
+   - Service queries `FWB_MST_BANK_CUST_PGP_KEY_LINK` by `CUST_ID` + `KEY_ACTIVE_FLAG='Y'`
+   - Loads the linked `BankPgpPrivateKey` record
+   - **Decrypts** the `KEY` blob using `PGPPrivateKeyEncryptionService`
+   - Loads the `CustomerPublicKey` record (if signing enabled)
+   - Downloads the customer's public key from S3 using `CUST_PUB_KEY_S3_PATH`
+   - Proceeds with PGP decryption
+
+## Sample Data (for testing)
+
+**Note**: You need to replace the `...encrypted blob base64...` placeholder with an actual encrypted key blob generated by `PGPPrivateKeyEncryptionService.encrypt()`.
+
+```sql
+-- 1. Insert a bank private key (encrypted)
+INSERT INTO FWB_MST_BANK_PGP_PRIVATE_KEY (
+    KEY_NAME, KEY, VALID_FROM, VALID_TO, KEY_TYPE, PASSPHRASE, KEY_ACTIVE_FLAG
+) VALUES (
+    'BANK_KEY_2026_Q1', 
+    decode('...encrypted blob base64...', 'base64'),
+    '2026-01-01', 
+    '2026-12-31', 
+    'RSA-4096', 
+    'YmFua3Bhc3NwaHJhc2UxMjM=',  -- Base64('bankpassphrase123')
+    'Y'
+);
+
+-- 2. Insert a customer public key
+INSERT INTO FWB_MST_PUBLIC_KEY (
+    CUST_ID, KEY_NAME, KEY_TYPE, VALID_FROM, VALID_TO, 
+    CUST_PUB_KEY_S3_PATH, KEY_ACTIVE_FLAG
+) VALUES (
+    1001, 
+    'CUST1001_PUB_2026', 
+    'RSA-4096', 
+    '2026-01-01', 
+    '2026-12-31',
+    'PGP_KEYS/CUSTOMERS/1001/pub_2026.asc',
+    'Y'
+);
+
+-- 3. Link the bank key to the customer public key record
+INSERT INTO FWB_MST_BANK_CUST_PGP_KEY_LINK (
+    BANK_KEY_SEQ, CUST_PUBLIC_KEY_SEQ, CUST_ID, KEY_ACTIVE_FLAG
+) VALUES (
+    1,      -- BANK_KEY_SEQ (auto-incremented from the bank key insert above)
+    1,      -- CUST_PUBLIC_KEY_SEQ (auto-incremented from the customer key insert above)
+    1001,   -- CUST_ID (denormalised for fast lookup)
+    'Y'
+);
+```
+
+## Troubleshooting
+
+### Error: "relation does not exist"
+
+The tables were not created successfully. Re-run the `create_tables.sql` script.
+
+### Error: "password authentication failed"
+
+Check your postgres user password. Update `application.properties` if needed:
+
+```properties
+spring.datasource.username=postgres
+spring.datasource.password=your_actual_password
+```
+
+### Error: "database APP_DB_1967 does not exist"
+
+Create the database first:
+
+```sql
+CREATE DATABASE APP_DB_1967;
+```
+
+Then re-run the table creation script.
+
+## Next Steps
+
+1. ✅ Tables created
+2. Configure the master encryption secret (see below)
+3. Populate test data using an external system or manual SQL
+4. Start the Spring Boot application
+
+## Master Encryption Secret Configuration
+
+The `PGPPrivateKeyEncryptionService` requires a master secret for encrypting/decrypting the bank's private keys. Set this via environment variable:
+
+```bash
+# Generate a strong random secret (example)
+export BANK_KEY_MASTER_SECRET="$(openssl rand -base64 32)"
+
+# Or set a fixed secret for local dev
+export BANK_KEY_MASTER_SECRET="my-local-dev-secret-do-not-use-in-production"
+```
+
+In production, use a secrets management system (AWS Secrets Manager, HashiCorp Vault, etc.) to inject this value.
+
+The service reads it from `application.properties`:
+
+```properties
+security.bank-key.master-secret=${BANK_KEY_MASTER_SECRET:default-dev-secret-replace-in-production}
+```
+
+---
+
+## Summary
+
+- ✅ Three tables created in `APP_DB_1967`
+- ✅ JPA entities mapped (`BankPgpPrivateKey`, `CustomerPublicKey`, `BankCustPgpKeyLink`)
+- ✅ `FileDecryptionOrchestrator` refactored to use the new schema
+- ✅ Bank private key encryption/decryption handled by `PGPPrivateKeyEncryptionService`
+- ✅ Customer public keys stored in S3, referenced by `CUST_PUB_KEY_S3_PATH`
+- ✅ Passphrase stored as Base64 in the database

@@ -3,27 +3,38 @@ package com.forward.security.model;
 import com.fasterxml.jackson.annotation.JsonProperty;
 
 /**
- * Outbound message written to the IBM MQ response queue.
+ * Outbound message written to {@code SECURITY.SERVICE.RESPONSE.QUEUE}.
  *
- * Fields:
- *  - encryptedFilePath  : the original S3 key of the encrypted file (echoed from request).
- *  - decryptedFilePath  : S3 key where the decrypted plaintext was stored;
- *                         null when decryptionSuccessful=false.
- *  - decryptionSuccessful : true when decryption (and signature verification, if opted)
- *                           completed without errors.
- *  - errorCode          : short error code for failures; null on success.
- *  - errorMessage       : human-readable failure reason; null on success.
+ * <p>Success:
+ * <pre>
+ * {
+ *   "custId"            : 1001,
+ *   "decrypted"         : true,
+ *   "decryptedFilePath" : "forward-bank-payments/FWB_DIRECT_DEBIT/PAYMENT_FILES/2026/02/04/DECRYPTED/I1234567890123.FWB.pain00800108.ABCD123.PM.xml"
+ * }
+ * </pre>
+ *
+ * <p>Failure:
+ * <pre>
+ * {
+ *   "custId"            : 1001,
+ *   "decrypted"         : false,
+ *   "decryptedFilePath" : "",
+ *   "errorCode"         : "SSE_002",
+ *   "errorMessage"      : "No matching bank private key found ..."
+ * }
+ * </pre>
  */
 public class DecryptionResponse {
 
-    @JsonProperty("encryptedFilePath")
-    private String encryptedFilePath;
+    @JsonProperty("custId")
+    private Long custId;
+
+    @JsonProperty("decrypted")
+    private boolean decrypted;
 
     @JsonProperty("decryptedFilePath")
     private String decryptedFilePath;
-
-    @JsonProperty("decryptionSuccessful")
-    private boolean decryptionSuccessful;
 
     @JsonProperty("errorCode")
     private String errorCode;
@@ -35,46 +46,45 @@ public class DecryptionResponse {
 
     // ── Factory methods ───────────────────────────────────────────────────────
 
-    public static DecryptionResponse success(String encryptedFilePath, String decryptedFilePath) {
+    public static DecryptionResponse success(Long custId, String decryptedFilePath) {
         DecryptionResponse r = new DecryptionResponse();
-        r.encryptedFilePath   = encryptedFilePath;
-        r.decryptedFilePath   = decryptedFilePath;
-        r.decryptionSuccessful = true;
+        r.custId            = custId;
+        r.decrypted         = true;
+        r.decryptedFilePath = decryptedFilePath;
         return r;
     }
 
-    public static DecryptionResponse failure(String encryptedFilePath,
+    public static DecryptionResponse failure(Long custId,
                                               String errorCode,
                                               String errorMessage) {
         DecryptionResponse r = new DecryptionResponse();
-        r.encryptedFilePath   = encryptedFilePath;
-        r.decryptedFilePath   = null;
-        r.decryptionSuccessful = false;
-        r.errorCode           = errorCode;
-        r.errorMessage        = errorMessage;
+        r.custId            = custId;
+        r.decrypted         = false;
+        r.decryptedFilePath = null;
+        r.errorCode         = errorCode;
+        r.errorMessage      = errorMessage;
         return r;
     }
 
     // ── Getters / setters ─────────────────────────────────────────────────────
 
-    public String  getEncryptedFilePath()    { return encryptedFilePath; }
-    public String  getDecryptedFilePath()    { return decryptedFilePath; }
-    public boolean isDecryptionSuccessful()  { return decryptionSuccessful; }
-    public String  getErrorCode()            { return errorCode; }
-    public String  getErrorMessage()         { return errorMessage; }
+    public Long    getCustId()            { return custId; }
+    public boolean isDecrypted()          { return decrypted; }
+    public String  getDecryptedFilePath() { return decryptedFilePath; }
+    public String  getErrorCode()         { return errorCode; }
+    public String  getErrorMessage()      { return errorMessage; }
 
-    public void setEncryptedFilePath(String encryptedFilePath)     { this.encryptedFilePath = encryptedFilePath; }
-    public void setDecryptedFilePath(String decryptedFilePath)     { this.decryptedFilePath = decryptedFilePath; }
-    public void setDecryptionSuccessful(boolean decryptionSuccessful) { this.decryptionSuccessful = decryptionSuccessful; }
-    public void setErrorCode(String errorCode)                     { this.errorCode = errorCode; }
-    public void setErrorMessage(String errorMessage)               { this.errorMessage = errorMessage; }
+    public void setCustId(Long custId)                        { this.custId = custId; }
+    public void setDecrypted(boolean decrypted)               { this.decrypted = decrypted; }
+    public void setDecryptedFilePath(String decryptedFilePath){ this.decryptedFilePath = decryptedFilePath; }
+    public void setErrorCode(String errorCode)                { this.errorCode = errorCode; }
+    public void setErrorMessage(String errorMessage)          { this.errorMessage = errorMessage; }
 
     @Override
     public String toString() {
-        return "DecryptionResponse{encryptedFilePath='" + encryptedFilePath
-                + "', decryptedFilePath='" + decryptedFilePath
-                + "', decryptionSuccessful=" + decryptionSuccessful
-                + ", errorCode='" + errorCode
-                + "', errorMessage='" + errorMessage + "'}";
+        return "DecryptionResponse{custId=" + custId
+                + ", decrypted=" + decrypted
+                + ", decryptedFilePath='" + decryptedFilePath
+                + "', errorCode='" + errorCode + "'}";
     }
 }

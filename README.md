@@ -2,6 +2,11 @@
 
 A Spring Boot microservice responsible for **PGP decryption** and **signature verification** of customer payment files in the Forward Bank Direct Debit pipeline.
 
+This service uses a **three-table schema** to manage PGP keys:
+- `FWB_MST_BANK_PGP_PRIVATE_KEY` — Bank's **encrypted** private keys
+- `FWB_MST_PUBLIC_KEY` — Customer public keys (stored in S3)
+- `FWB_MST_BANK_CUST_PGP_KEY_LINK` — Links bank keys to customers
+
 ---
 
 ## How It Fits in the System
@@ -51,26 +56,37 @@ fwb-direct-debit-workflow-service  (Camunda BPMN engine)
 }
 ```
 
-### 2 — Load key configuration from DB
+### 2 — Load key configuration from DB (three-table lookup)
 
-`CustomerKeyConfigRepository.findById(customerId)` retrieves the `CUSTOMER_KEY_CONFIG` row which contains:
-- `bankPrivateKeyPath` — S3 key of the bank's armored PGP private key
-- `bankKeyPassphraseBase64` — Base64-encoded passphrase for the bank's private key
-- `customerPublicKeyPath` — S3 key of the customer's armored PGP public key
+The orchestrator queries `FWB_MST_BANK_CUST_PGP_KEY_LINK` to find the active key link for the customer:
 
-### 3 — Download PGP keys from S3
+```sql
+SELECT * FROM FWB_MST_BANK_CUST_PGP_KEY_LINK
+WHERE CUST_ID = ? AND KEY_ACTIVE_FLAG = 'Y'
+LIMIT 1
+```
 
-`S3StreamDownloader.downloadBytes()` fetches the bank private key and (when signing is enabled) the customer public key. These are typically small armored text files.
+Then loads:
+1. `BankPgpPrivateKey` using `BANK_KEY_SEQ` from the link
+2. `CustomerPublicKey` using `CUST_ID` (when signing enabled)
 
-### 4 — Decode the passphrase
+### 3 — Decrypt the bank's PGP private key
 
-The Base64-encoded passphrase is decoded to `char[]` at runtime. The array is zeroed out in a `finally` block immediately after use.
+The `KEY` column in `FWB_MST_BANK_PGP_PRIVATE_KEY` holds an **encrypted** blob. `PGPPrivateKeyEncryptionService.decrypt()` unwraps it using AES-256-GCM with PBKDF2 key derivation, yielding the armored PGP private key bytes.
 
-### 5 — Open encrypted file as a stream
+### 4 — Download customer's public key from S3
+
+`CustomerPublicKey.getCustPubKeyS3Path()` points to the S3 location of the customer's armored `.asc` public key. `S3StreamDownloader.downloadBytes()` fetches it.
+
+### 5 — Decode the PGP passphrase
+
+The `PASSPHRASE` column is Base64-encoded. Decode it to `char[]` at runtime, use it to unlock the PGP private key, then zero it out immediately in a `finally` block.
+
+### 6 — Open encrypted file as a stream
 
 `S3StreamDownloader.openStream()` opens a **streaming** `InputStream` directly backed by the S3 response body. The encrypted file is never fully loaded into memory — the Bouncy Castle PGP API reads it on-demand.
 
-### 6 — PGP decryption and signature verification
+### 7 — PGP decryption and signature verification
 
 `PgpDecryptionService.decrypt()` handles both modes:
 
@@ -81,7 +97,7 @@ The Base64-encoded passphrase is decoded to `char[]` at runtime. The array is ze
 
 After decryption, PGP message integrity (MDC) is verified when present.
 
-### 7 — Upload decrypted file to S3
+### 8 — Upload decrypted file to S3
 
 The plaintext bytes are written to S3 at a computed path derived from the encrypted path:
 - `INCOMING` → `DECRYPTED`
@@ -93,7 +109,7 @@ encrypted : FWB_DIRECT_DEBIT/PAYMENT_FILES/2026/02/04/INCOMING/payment.xml.pgp
 decrypted : FWB_DIRECT_DEBIT/PAYMENT_FILES/2026/02/04/DECRYPTED/payment.xml
 ```
 
-### 8 — Send response
+### 9 — Send response
 
 ```json
 // Success
@@ -134,7 +150,8 @@ src/main/java/com/forward/security/
 │       └── DecryptionRequestListener.java    # Core MQ message handler
 │
 ├── service/
-│   └── FileDecryptionOrchestrator.java       # End-to-end decryption flow coordinator
+│   ├── FileDecryptionOrchestrator.java       # End-to-end decryption flow coordinator
+│   └── PGPPrivateKeyEncryptionService.java   # AES-256-GCM encryption for bank private key blobs
 │
 ├── pgp/
 │   ├── PgpDecryptionService.java             # Bouncy Castle PGP decrypt + verify
@@ -149,10 +166,17 @@ src/main/java/com/forward/security/
 │   └── DecryptionResponse.java               # Outbound MQ message model
 │
 ├── entity/
-│   └── CustomerKeyConfig.java                # JPA entity for CUSTOMER_KEY_CONFIG table
+│   ├── BankPgpPrivateKey.java                # JPA entity → FWB_MST_BANK_PGP_PRIVATE_KEY
+│   ├── CustomerPublicKey.java                # JPA entity → FWB_MST_PUBLIC_KEY
+│   └── BankCustPgpKeyLink.java               # JPA entity → FWB_MST_BANK_CUST_PGP_KEY_LINK
 │
 └── repository/
-    └── CustomerKeyConfigRepository.java      # Spring Data JPA repository
+    ├── BankPgpPrivateKeyRepository.java      # JPA repo for bank private keys
+    ├── CustomerPublicKeyRepository.java      # JPA repo for customer public keys
+    └── BankCustPgpKeyLinkRepository.java     # JPA repo for bank-customer key links
+
+database/
+└── create_tables.sql                         # DDL for all three tables in APP_DB_1967
 ```
 
 ---

@@ -1,198 +1,252 @@
 package com.forward.security.service;
 
-import com.forward.security.entity.CustomerKeyConfig;
+import com.forward.security.entity.BankPgpPrivateKey;
+import com.forward.security.entity.CustomerPublicKey;
 import com.forward.security.model.DecryptionRequest;
 import com.forward.security.model.DecryptionResponse;
 import com.forward.security.pgp.PgpDecryptionResult;
 import com.forward.security.pgp.PgpDecryptionService;
-import com.forward.security.repository.CustomerKeyConfigRepository;
+import com.forward.security.repository.BankCustPgpKeyLinkRepository;
+import com.forward.security.repository.CustomerPublicKeyRepository;
 import com.forward.security.s3.S3StreamDownloader;
 import com.forward.security.s3.S3Uploader;
 import org.springframework.stereotype.Service;
 
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.Optional;
 
 /**
- * Orchestrates the end-to-end file decryption flow:
+ * Orchestrates end-to-end PGP decryption of a customer payment file.
  *
- *  1. Validate the request fields.
- *  2. Look up the customer's key configuration (key S3 paths + passphrase) from the DB.
- *  3. Download the bank's private key bytes from S3.
- *  4. Download the customer's public key bytes from S3 (only when signing is enabled).
- *  5. Decode the Base64 passphrase.
- *  6. Open a streaming InputStream for the encrypted payment file.
- *  7. Invoke {@link PgpDecryptionService} to decrypt and optionally verify the signature.
- *  8. Upload the plaintext to S3 at the computed decrypted file path.
- *  9. Return a {@link DecryptionResponse}.
+ * <h2>DB lookup</h2>
+ * Joins {@code FWB_MST_BANK_CUST_PGP_KEY_LINK} and
+ * {@code FWB_MST_BANK_PGP_PRIVATE_KEY} on {@code BANK_KEY_SEQ} for the given
+ * {@code CUST_ID} to obtain:
+ * <ul>
+ *   <li>The raw PGP private key bytes stored in the {@code KEY} BYTEA column.</li>
+ *   <li>The Base64-encoded PGP passphrase stored in the {@code PASSPHRASE} column.</li>
+ * </ul>
  *
- * The decrypted file is placed next to the encrypted file under a DECRYPTED sub-path.
- * For example:
- *   encrypted : FWB_DIRECT_DEBIT/PAYMENT_FILES/2026/02/04/INCOMING/payment.xml.pgp
- *   decrypted : FWB_DIRECT_DEBIT/PAYMENT_FILES/2026/02/04/DECRYPTED/payment.xml
+ * <h2>Decrypted file path rule</h2>
+ * Given an input {@code fileS3Path}:
+ * <pre>
+ *   forward-bank-payments/FWB_DIRECT_DEBIT/PAYMENT_FILES/2026/02/04/INCOMING/
+ *       I1234567890123.FWB.pain00800108.ABCD123.PM.pgp_12345145
+ * </pre>
+ * The decrypted path is built by:
+ * <ol>
+ *   <li>Replace {@code /INCOMING/} with {@code /DECRYPTED/} in the directory part.</li>
+ *   <li>Take the filename up to and including {@code .PM}, then append {@code .xml}.</li>
+ * </ol>
+ * Result:
+ * <pre>
+ *   forward-bank-payments/FWB_DIRECT_DEBIT/PAYMENT_FILES/2026/02/04/DECRYPTED/
+ *       I1234567890123.FWB.pain00800108.ABCD123.PM.xml
+ * </pre>
  */
 @Service
 public class FileDecryptionOrchestrator {
 
-    private final CustomerKeyConfigRepository keyConfigRepository;
-    private final S3StreamDownloader          s3Downloader;
-    private final S3Uploader                  s3Uploader;
-    private final PgpDecryptionService        pgpDecryptionService;
+    private final BankCustPgpKeyLinkRepository keyLinkRepository;
+    private final CustomerPublicKeyRepository  customerKeyRepository;
+    private final S3StreamDownloader           s3Downloader;
+    private final S3Uploader                   s3Uploader;
+    private final PgpDecryptionService         pgpDecryptionService;
 
-    public FileDecryptionOrchestrator(CustomerKeyConfigRepository keyConfigRepository,
+    public FileDecryptionOrchestrator(BankCustPgpKeyLinkRepository keyLinkRepository,
+                                      CustomerPublicKeyRepository customerKeyRepository,
                                       S3StreamDownloader s3Downloader,
                                       S3Uploader s3Uploader,
                                       PgpDecryptionService pgpDecryptionService) {
-        this.keyConfigRepository  = keyConfigRepository;
-        this.s3Downloader         = s3Downloader;
-        this.s3Uploader           = s3Uploader;
-        this.pgpDecryptionService = pgpDecryptionService;
+        this.keyLinkRepository    = keyLinkRepository;
+        this.customerKeyRepository = customerKeyRepository;
+        this.s3Downloader          = s3Downloader;
+        this.s3Uploader            = s3Uploader;
+        this.pgpDecryptionService  = pgpDecryptionService;
     }
 
     /**
      * Processes one decryption request end-to-end.
      *
-     * @param request the inbound MQ message payload; never null.
-     * @return a {@link DecryptionResponse} — always non-null.
+     * @param request inbound MQ message payload; never null
+     * @return {@link DecryptionResponse} — always non-null
      */
     public DecryptionResponse process(DecryptionRequest request) {
 
         // ── Step 1: input validation ──────────────────────────────────────────
-        if (request.getCustomerId() == null || request.getCustomerId().isBlank()) {
-            return DecryptionResponse.failure(null, "SSE_001", "customerId must not be null or blank");
+        Long custId = request.getCustId();
+        if (custId == null) {
+            return DecryptionResponse.failure(null, "SSE_001",
+                    "custId must not be null");
         }
-        if (request.getEncryptedFilePath() == null || request.getEncryptedFilePath().isBlank()) {
-            return DecryptionResponse.failure(request.getEncryptedFilePath(),
-                    "SSE_001", "encryptedFilePath must not be null or blank");
+        String fileS3Path = request.getFileS3Path();
+        if (fileS3Path == null || fileS3Path.isBlank()) {
+            return DecryptionResponse.failure(custId, "SSE_001",
+                    "fileS3Path must not be null or blank");
         }
-
-        String customerId         = request.getCustomerId();
-        String encryptedFilePath  = request.getEncryptedFilePath();
         boolean pgpSigningEnabled = request.isPgpSigningEnabled();
 
-        // ── Step 2: load key configuration from DB ────────────────────────────
-        Optional<CustomerKeyConfig> configOpt = keyConfigRepository.findById(customerId);
-        if (configOpt.isEmpty()) {
-            return DecryptionResponse.failure(encryptedFilePath, "SSE_009",
-                    "No key configuration found for customer ID: " + customerId);
-        }
-        CustomerKeyConfig keyConfig = configOpt.get();
+        System.out.println("  [FileDecryptionOrchestrator] processing"
+                + " | custId=" + custId
+                + " | fileS3Path=" + fileS3Path
+                + " | pgpSigning=" + pgpSigningEnabled);
 
-        // ── Step 3: download the bank's private key from S3 ──────────────────
-        byte[] bankPrivateKeyBytes;
-        try {
-            bankPrivateKeyBytes = s3Downloader.downloadBytes(keyConfig.getBankPrivateKeyPath());
-        } catch (S3StreamDownloader.S3DownloadException e) {
-            return DecryptionResponse.failure(encryptedFilePath, "SSE_010",
-                    "Failed to download bank private key from S3: " + e.getMessage());
+        // ── Step 2: join FWB_MST_BANK_CUST_PGP_KEY_LINK → FWB_MST_BANK_PGP_PRIVATE_KEY
+        //           to get the active bank private key for this customer ────────
+        Optional<BankPgpPrivateKey> bankKeyOpt =
+                keyLinkRepository.findActiveBankKeyByCustId(custId);
+        if (bankKeyOpt.isEmpty()) {
+            return DecryptionResponse.failure(custId, "SSE_009",
+                    "No active bank private key linked to customer ID: " + custId
+                    + ". Check FWB_MST_BANK_CUST_PGP_KEY_LINK and FWB_MST_BANK_PGP_PRIVATE_KEY.");
+        }
+        BankPgpPrivateKey bankKey = bankKeyOpt.get();
+
+        System.out.println("  [FileDecryptionOrchestrator] found bank key"
+                + " | bankKeySeq=" + bankKey.getBankKeySeq()
+                + " | keyName=" + bankKey.getKeyName());
+
+        // ── Step 3: the KEY column holds the raw PGP private key bytes ─────────
+        //    (stored as BYTEA — no application-level decryption needed)
+        byte[] bankPrivateKeyBytes = bankKey.getKey();
+        if (bankPrivateKeyBytes == null || bankPrivateKeyBytes.length == 0) {
+            return DecryptionResponse.failure(custId, "SSE_009",
+                    "Bank private key blob is empty for bankKeySeq: " + bankKey.getBankKeySeq());
         }
 
-        // ── Step 4: download the customer's public key from S3 (if signing) ──
+        // ── Step 4: download the customer's public key from S3 (signing only) ──
         byte[] customerPublicKeyBytes = null;
         if (pgpSigningEnabled) {
+            Optional<CustomerPublicKey> custKeyOpt =
+                    customerKeyRepository.findFirstByCustIdAndKeyActiveFlag(custId, "Y");
+            if (custKeyOpt.isEmpty()) {
+                return DecryptionResponse.failure(custId, "SSE_009",
+                        "No active public key found for customer ID: " + custId);
+            }
+            CustomerPublicKey custKey = custKeyOpt.get();
             try {
-                customerPublicKeyBytes = s3Downloader.downloadBytes(keyConfig.getCustomerPublicKeyPath());
+                customerPublicKeyBytes = s3Downloader.downloadBytes(custKey.getCustPubKeyS3Path());
             } catch (S3StreamDownloader.S3DownloadException e) {
-                return DecryptionResponse.failure(encryptedFilePath, "SSE_010",
+                return DecryptionResponse.failure(custId, "SSE_010",
                         "Failed to download customer public key from S3: " + e.getMessage());
             }
         }
 
-        // ── Step 5: decode the Base64 passphrase ──────────────────────────────
-        char[] passphraseChars;
+        // ── Step 5: decode the Base64 PGP passphrase ──────────────────────────
+        char[] passphraseChars = null;
         try {
-            byte[] decodedBytes = Base64.getDecoder().decode(keyConfig.getBankKeyPassphraseBase64());
-            passphraseChars = new String(decodedBytes, java.nio.charset.StandardCharsets.UTF_8).toCharArray();
+            byte[] decoded = Base64.getMimeDecoder().decode(bankKey.getPassphrase().trim());
+            passphraseChars = new String(decoded, StandardCharsets.UTF_8).toCharArray();
         } catch (IllegalArgumentException e) {
-            return DecryptionResponse.failure(encryptedFilePath, "SSE_011",
+            return DecryptionResponse.failure(custId, "SSE_011",
                     "Bank key passphrase is not valid Base64: " + e.getMessage());
         }
 
-        // ── Step 6: open a streaming InputStream for the encrypted file ───────
+        // ── Step 6: stream the encrypted file from S3 and decrypt ─────────────
         InputStream encryptedStream = null;
         try {
-            encryptedStream = s3Downloader.openStream(encryptedFilePath);
+            encryptedStream = s3Downloader.openStream(fileS3Path);
 
-            // ── Step 7: PGP decryption + optional signature verification ──────
             PgpDecryptionResult pgpResult = pgpDecryptionService.decrypt(
                     encryptedStream,
                     bankPrivateKeyBytes,
                     passphraseChars,
                     customerPublicKeyBytes,
-                    pgpSigningEnabled
-            );
+                    pgpSigningEnabled);
 
             if (!pgpResult.isSuccess()) {
-                return DecryptionResponse.failure(encryptedFilePath,
+                return DecryptionResponse.failure(custId,
                         pgpResult.getErrorCode(),
                         pgpResult.getErrorMessage());
             }
 
-            // ── Step 8: upload the decrypted plaintext to S3 ─────────────────
-            String decryptedFilePath = buildDecryptedFilePath(encryptedFilePath);
+            // ── Step 7: build decrypted S3 path and upload ────────────────────
+            String decryptedFilePath = buildDecryptedFilePath(fileS3Path);
+
             try {
                 s3Uploader.upload(decryptedFilePath, pgpResult.getPlaintext());
             } catch (S3Uploader.S3UploadException e) {
-                return DecryptionResponse.failure(encryptedFilePath, "SSE_012",
+                return DecryptionResponse.failure(custId, "SSE_012",
                         "Failed to upload decrypted file to S3: " + e.getMessage());
             }
 
-            // ── Step 9: return success ────────────────────────────────────────
             System.out.println("  [FileDecryptionOrchestrator] ✓ decryption complete"
-                    + " | customerId=" + customerId
+                    + " | custId=" + custId
+                    + " | bankKeySeq=" + bankKey.getBankKeySeq()
                     + " | signatureVerified=" + pgpResult.isSignatureVerified()
                     + " | decryptedPath=" + decryptedFilePath);
 
-            return DecryptionResponse.success(encryptedFilePath, decryptedFilePath);
+            return DecryptionResponse.success(custId, decryptedFilePath);
 
         } catch (S3StreamDownloader.S3DownloadException e) {
-            return DecryptionResponse.failure(encryptedFilePath, "SSE_010",
+            return DecryptionResponse.failure(custId, "SSE_010",
                     "Failed to open encrypted file stream from S3: " + e.getMessage());
         } finally {
-            // Always close the stream — the PGP engine reads lazily
             if (encryptedStream != null) {
-                try {
-                    encryptedStream.close();
-                } catch (Exception ignored) {
-                    // best effort
-                }
+                try { encryptedStream.close(); } catch (Exception ignored) {}
             }
-            // Zero out the passphrase from memory as soon as it is no longer needed
+            // Zero out passphrase bytes from memory immediately after use
             if (passphraseChars != null) {
-                java.util.Arrays.fill(passphraseChars, '\0');
+                Arrays.fill(passphraseChars, '\0');
             }
         }
     }
 
-    // ── Path computation ──────────────────────────────────────────────────────
+    // ── Decrypted file path computation ───────────────────────────────────────
 
     /**
-     * Derives the S3 key for the decrypted output file from the encrypted file path.
+     * Builds the S3 path for the decrypted output file.
      *
-     * Strategy:
-     *  - Replace the path segment "INCOMING" with "DECRYPTED".
-     *  - Strip the trailing ".pgp" or ".gpg" extension if present.
+     * <p>Rules:
+     * <ol>
+     *   <li>Replace {@code /INCOMING/} with {@code /DECRYPTED/} in the path.</li>
+     *   <li>Take the filename up to and including the {@code .PM} segment, then
+     *       append {@code .xml} — discarding everything after {@code .PM}.</li>
+     * </ol>
      *
-     * Example:
-     *   input  : FWB_DIRECT_DEBIT/PAYMENT_FILES/2026/02/04/INCOMING/payment.xml.pgp
-     *   output : FWB_DIRECT_DEBIT/PAYMENT_FILES/2026/02/04/DECRYPTED/payment.xml
+     * <p>Examples:
+     * <pre>
+     *   Input : forward-bank-payments/FWB_DIRECT_DEBIT/PAYMENT_FILES/2026/02/04/INCOMING/I1234567890123.FWB.pain00800108.ABCD123.PM.pgp_12345145
+     *   Output: forward-bank-payments/FWB_DIRECT_DEBIT/PAYMENT_FILES/2026/02/04/DECRYPTED/I1234567890123.FWB.pain00800108.ABCD123.PM.xml
+     *
+     *   Input : forward-bank-payments/FWB_DIRECT_DEBIT/PAYMENT_FILES/2026/02/04/INCOMING/I9876543210987.FWB.pain00800108.XYZ999.PM.pgp
+     *   Output: forward-bank-payments/FWB_DIRECT_DEBIT/PAYMENT_FILES/2026/02/04/DECRYPTED/I9876543210987.FWB.pain00800108.XYZ999.PM.xml
+     * </pre>
+     *
+     * @param fileS3Path full S3 path of the encrypted file (bucket + key)
+     * @return full S3 path for the decrypted file
+     * @throws IllegalArgumentException if the path does not contain {@code .PM}
      */
-    private String buildDecryptedFilePath(String encryptedFilePath) {
-        String path = encryptedFilePath;
+    static String buildDecryptedFilePath(String fileS3Path) {
+        // 1. Replace /INCOMING/ with /DECRYPTED/ (directory segment only)
+        String path = fileS3Path.replace("/INCOMING/", "/DECRYPTED/");
 
-        // Replace INCOMING directory with DECRYPTED
-        path = path.replace("/INCOMING/", "/DECRYPTED/");
+        // 2. Split directory from filename
+        int lastSlash = path.lastIndexOf('/');
+        String directory = (lastSlash >= 0) ? path.substring(0, lastSlash + 1) : "";
+        String filename  = (lastSlash >= 0) ? path.substring(lastSlash + 1)    : path;
 
-        // Strip PGP file extension
-        if (path.endsWith(".pgp")) {
-            path = path.substring(0, path.length() - 4);
-        } else if (path.endsWith(".gpg")) {
-            path = path.substring(0, path.length() - 4);
-        } else if (path.endsWith(".asc")) {
-            path = path.substring(0, path.length() - 4);
+        // 3. Trim filename to everything up to and including ".PM"
+        //    The marker is ".PM" followed by either "." or end-of-string.
+        //    We search for ".PM" and take the portion up to and including it.
+        int pmIndex = filename.indexOf(".PM.");
+        if (pmIndex == -1) {
+            // Handle case where .PM is the very end of the filename (no trailing dot)
+            if (filename.endsWith(".PM")) {
+                pmIndex = filename.length() - 3;
+            } else {
+                throw new IllegalArgumentException(
+                        "Cannot build decrypted file path: '.PM' marker not found in filename '"
+                        + filename + "' (full path: " + fileS3Path + ")");
+            }
         }
 
-        return path;
+        // Keep everything up to and including ".PM"
+        String decryptedFilename = filename.substring(0, pmIndex + 3) + ".xml";
+
+        return directory + decryptedFilename;
     }
 }

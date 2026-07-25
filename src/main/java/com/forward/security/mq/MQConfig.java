@@ -10,11 +10,11 @@ public class MQConfig {
     private final String channel;
     private final String queueManager;
 
-    /** Inbound: receives decryption requests from the workflow service. */
-    public static final String REQUEST_QUEUE  = "SECURITY.DECRYPTION.REQUEST.QUEUE";
+    /** Inbound: receives decryption requests. */
+    public static final String REQUEST_QUEUE  = "SECURITY.SERVICE.REQUEST.QUEUE";
 
-    /** Outbound: sends decryption results back to the workflow service. */
-    public static final String RESPONSE_QUEUE = "SECURITY.DECRYPTION.RESPONSE.QUEUE";
+    /** Outbound: sends decryption results. */
+    public static final String RESPONSE_QUEUE = "SECURITY.SERVICE.RESPONSE.QUEUE";
 
     public MQConfig(String host, int port, String channel, String queueManager) {
         this.host         = host;
