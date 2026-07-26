@@ -147,6 +147,8 @@ public class FileDecryptionOrchestrator {
         // ── Step 4: download the customer's public key from S3 (signing only) ──
         byte[] customerPublicKeyBytes = null;
         if (pgpSigningEnabled) {
+            System.out.println("  [FileDecryptionOrchestrator] PGP signing enabled); fetching customer public key for signature verification"
+                    + " | custId=" + custId);
             Optional<CustomerPublicKey> custKeyOpt =
                     customerKeyRepository.findFirstByCustIdAndKeyActiveFlag(custId, "Y");
             if (custKeyOpt.isEmpty()) {

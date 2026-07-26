@@ -198,7 +198,7 @@ public class PgpDecryptionService {
      *   PGPSignatureList         — completes and verifies the signature
      */
     private PgpDecryptionResult decryptSigned(PGPObjectFactory plainFactory,
-                                               byte[] customerPublicKeyBytes)
+                                              byte[] customerPublicKeyBytes)
             throws IOException, PGPException {
 
         Object obj = plainFactory.nextObject();
@@ -257,7 +257,12 @@ public class PgpDecryptionService {
         PGPSignature signature = sigList.get(0);
         boolean signatureValid;
         try {
-            signatureValid = signature.verify();
+            // IMPORTANT: verify against the one-pass signature object that accumulated
+            // the hash via update() above — NOT signature.verify(), which would require
+            // `signature` itself to have been init()'d and fed data (it never was, and
+            // calling it directly throws an NPE on the internal, never-initialized
+            // output stream).
+            signatureValid = onePassSig.verify(signature);
         } catch (Exception e) {
             return PgpDecryptionResult.failure("SSE_005",
                     "Signature verification threw an exception: " + e.getMessage());
@@ -268,7 +273,7 @@ public class PgpDecryptionService {
                     "PGP signature verification failed — file may have been tampered with "
                             + "or signed with an unregistered key");
         }
-
+        System.out.println("  [PgpDecryptionService] ✓ signature verified successfully");
         return PgpDecryptionResult.success(plaintext, true);
     }
 
