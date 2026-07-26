@@ -22,6 +22,67 @@ This service uses a **three-table schema** to manage PGP keys:
 - `FWB_MST_PUBLIC_KEY` — Customer public keys (stored in S3)
 - `FWB_MST_BANK_CUST_PGP_KEY_LINK` — Links bank keys to customers
 
+## SQL statements for data setup
+```sql
+INSERT INTO FWB_MST_BANK_PGP_PRIVATE_KEY (
+    KEY_NAME,
+    KEY,
+    VALID_FROM,
+    VALID_TO,
+    KEY_ACTIVE_FLAG,
+    KEY_TYPE,
+    PASSPHRASE,
+    BANK_PVT_KEY_S3_PATH
+) VALUES (
+    'BANK_KEY_2026_Q1',
+    null,
+    '2026-01-01',
+    '2029-01-01',
+    'Y',
+    'PGP',
+    'SU5JVElBTElaQVRJT04gVuBY0dcv93FtbJxAqzP3dRQ=',
+    'forward-bank-payments/DEV/PGP_KEYS/BANK/PRIVATE/Forward_Bank_0x7C56E1A820421C1D_SECRET.asc'
+);
+
+
+
+
+INSERT INTO FWB_MST_PUBLIC_KEY (
+    CUST_ID,
+    KEY_ACTIVE_FLAG,
+    KEY_NAME,
+    KEY_TYPE,
+    KEY,
+    VALID_FROM,
+    VALID_TO,
+    CUST_PUB_KEY_S3_PATH
+) VALUES (
+    1001,                                            
+    'Y',                                              
+    'CUST1001_PUB_2026',                             
+    'PGP',                                       
+     NULL,                                             
+    '2026-01-01',                                     
+    '2029-01-01',                                     
+    'forward-bank-payments/DEV/PGP_KEYS/CUSTOMERS/1001/Hexa_Consulting_0x3497C5F5C5F1D494_public.asc'
+);
+
+
+
+
+INSERT INTO FWB_MST_BANK_CUST_PGP_KEY_LINK (
+    BANK_KEY_SEQ,
+    CUST_PUBLIC_KEY_SEQ,
+    CUST_ID,
+    KEY_ACTIVE_FLAG
+) VALUES (
+    2,          
+    1,
+    1001,
+    'Y'
+);
+```
+
 ---
 
 ## How It Fits in the System
