@@ -2,6 +2,21 @@
 
 A Spring Boot microservice responsible for **PGP decryption** and **signature verification** of customer payment files in the Forward Bank Direct Debit pipeline.
 
+## Localstack aws commands for setup
+```bash
+
+aws s3 mb s3://forward-bank-payments --endpoint-url=http://localhost:4566
+
+aws s3 cp Forward_Bank_0x7C56E1A820421C1D_SECRET.asc s3://forward-bank-payments/DEV/PGP_KEYS/BANK/PRIVATE/Forward_Bank_0x7C56E1A820421C1D_SECRET.asc --endpoint-url=http://localhost:4566
+
+aws s3 cp Hexa_Consulting_0x3497C5F5C5F1D494_public.asc s3://forward-bank-payments/DEV/PGP_KEYS/CUSTOMERS/1001/Hexa_Consulting_0x3497C5F5C5F1D494_public.asc --endpoint-url=http://localhost:4566
+
+aws s3 cp  pain.008.001.08.PM.pgp  s3://forward-bank-payments/FWB_DIRECT_DEBIT/PAYMENT_FILES/2026/02/04/INCOMING/I1234567890123.FWB.pain00800108.ABCD123.PM.pgp_12345145 --endpoint-url=http://localhost:4566
+
+aws s3 cp  pain.008.001.08.PM.signed.pgp  s3://forward-bank-payments/FWB_DIRECT_DEBIT/PAYMENT_FILES/2026/03/03/INCOMING/S1234567890123.FWB.pain00800108.SBCD123.PM.signed.pgp_12345145 --endpoint-url=http://localhost:4566
+
+```
+
 This service uses a **three-table schema** to manage PGP keys:
 - `FWB_MST_BANK_PGP_PRIVATE_KEY` — Bank's **encrypted** private keys
 - `FWB_MST_PUBLIC_KEY` — Customer public keys (stored in S3)
