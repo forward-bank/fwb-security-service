@@ -17,6 +17,14 @@ aws s3 cp  pain.008.001.08.PM.signed.pgp  s3://forward-bank-payments/FWB_DIRECT_
 
 ```
 
+### Test messages for direct-debit-workflow input queue
+```json
+{"fileDataSeq": 314900,"channelRef": "I1234567890123","outputChannelCode": "ABB","fileS3Path": "forward-bank-payments/FWB_DIRECT_DEBIT/PAYMENT_FILES/2026/02/04/INCOMING/I1234567890123.FWB.pain00800108.ABCD123.PM.pgp_12345145"}
+
+{"fileDataSeq": 414900,"channelRef": "S1234567890123","outputChannelCode": "SBB","fileS3Path": "forward-bank-payments/FWB_DIRECT_DEBIT/PAYMENT_FILES/2026/03/03/INCOMING/S1234567890123.FWB.pain00800108.SBCD123.PM.signed.pgp_12345145"}
+
+```
+
 This service uses a **three-table schema** to manage PGP keys:
 - `FWB_MST_BANK_PGP_PRIVATE_KEY` — Bank's **encrypted** private keys
 - `FWB_MST_PUBLIC_KEY` — Customer public keys (stored in S3)
