@@ -17,7 +17,7 @@ aws s3 cp  pain.008.001.08.PM.signed.pgp  s3://forward-bank-payments/FWB_DIRECT_
 
 ```
 
-### Test messages for direct-debit-workflow input queue
+### Test messages for direct-debit-workflow input queue for both encryption and encryption+sign
 ```json
 {"fileDataSeq": 314900,"channelRef": "I1234567890123","outputChannelCode": "ABB","fileS3Path": "forward-bank-payments/FWB_DIRECT_DEBIT/PAYMENT_FILES/2026/02/04/INCOMING/I1234567890123.FWB.pain00800108.ABCD123.PM.pgp_12345145"}
 
